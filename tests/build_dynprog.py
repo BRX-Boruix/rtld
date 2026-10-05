@@ -33,7 +33,12 @@ def build(stem):
     obj = os.path.join(HERE, stem + ".o")
     out = os.path.join(HERE, stem + ".elf")
     run([CLANG, TARGET, "-ffreestanding", "-fno-builtin", "-fPIE", "-O2", "-c", src, "-o", obj])
+    # `-u dlopen -u dlsym -u dlerror`：这三个由 **rtld 运行期提供**（不在任何 .so 里），
+    # 链接期必然未解析。**不能用 `--unresolved-symbols=ignore-all`**——实测它会把符号
+    # 从动态符号表里**删掉**（只剩 UND printf），PLT 于是解析到 0；`-u` 才把它们保留为
+    # 未定义动态符号，交给 rtld 在运行期解析（解析不到时 rtld 如实报错）。
     run([LLD, "-pie", "-e", "check", "--no-dynamic-linker", "-z", "norelro",
+         "-u", "dlopen", "-u", "dlsym", "-u", "dlerror",
          "--export-dynamic", "-o", out, obj,
          "-L" + os.path.dirname(SO), "-l:libboruixc.so.1"])
     print("[build_dynprog] 产出", out)

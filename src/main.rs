@@ -203,6 +203,12 @@ struct Object {
     path: String,
     base: u64,
     dyn_: Vec<(u64, u64)>,
+    /// 该对象是否带 `PT_TLS`。
+    ///
+    /// 用于 ADR-053 的 **D4**：`dlopen` 一个带 TLS 的 `.so` 必须**如实拒绝**——
+    /// initial-exec 的偏移必须在进程启动时确定，运行期追加会改变已有模块的偏移
+    /// （已装载模块的 GOT 槽全部失效）。
+    has_tls: bool,
 }
 
 impl Object {
@@ -284,6 +290,7 @@ fn load_object(image: &[u8], path: &str) -> Result<Object, String> {
         path: path.to_string(),
         base,
         dyn_,
+        has_tls: phdrs.iter().any(|p| p.p_type == 7),
     })
 }
 
@@ -344,6 +351,10 @@ fn load_closure(main_path: &str) -> Result<Vec<Object>, String> {
 /// `st_shndx == 0` 表示**未定义**（引用），不算定义——这一条是正确性的关键：
 /// 若不排除，引用方自己的 UND 符号会先被命中，拿到的是 0 或错值。
 fn resolve(objs: &[Object], name: &str) -> Option<u64> {
+    // **内置表优先**：`dlopen`/`dlsym`/`dlerror` 由 rtld 自己提供（3P5-3）。
+    if let Some(a) = builtin_symbol(name) {
+        return Some(a);
+    }
     for o in objs.iter() {
         for si in 1..o.nsyms() {
             if let Some((n, val, shndx)) = o.sym(si) {
@@ -416,6 +427,116 @@ fn relocate_all(objs: &[Object]) -> Result<usize, String> {
     Ok(total)
 }
 
+// ---------- 运行期装载 API（3P5-3：dlopen/dlsym）----------
+//
+// 由 **rtld 自己**提供（不是 libc）：这些调用需要 rtld 的装载器状态（已装载对象表）。
+// 被装载程序里的 `UND dlopen` 经 `resolve` 的**内置表**解析到这里。
+
+/// 已装载对象表。
+///
+/// **前提（如实声明）**：rtld 目前单线程运行，故不加锁。若将来 rtld 引入并发装载，
+/// 这里必须换成带锁的容器。
+static mut OBJECTS: Vec<Object> = Vec::new();
+/// 最近一次错误的描述（`dlerror` 的返回值）。
+static mut LAST_ERR: Option<String> = None;
+
+fn set_err(msg: &str) {
+    unsafe { LAST_ERR = Some(msg.to_string()) };
+}
+
+/// `dlopen(path, flags)`：运行期装载一个共享库，返回**不透明句柄**（失败返回 NULL）。
+///
+/// **支持**：`RTLD_LAZY`/`RTLD_NOW`/`RTLD_GLOBAL`/`RTLD_LOCAL` 的语义（本实现一律**立即**
+/// 解析全部重定位，故 LAZY 与 NOW 无区别——如实声明）；`RTLD_NOLOAD` 等未实现。
+///
+/// **带 `PT_TLS` 的 `.so` 如实拒绝**（ADR-053 D4）：initial-exec 的偏移必须在进程启动时
+/// 确定，运行期追加会改变已有模块的偏移，已装载模块的 GOT 槽会全部失效。
+#[unsafe(no_mangle)]
+pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
+    let _ = flags;
+    if path.is_null() {
+        set_err("dlopen: path 为 NULL");
+        return core::ptr::null_mut();
+    }
+    let p = unsafe { read_cstr(path as u64) };
+    let img = match boruix_std::fs::read_to_end(&p) {
+        Ok(v) => v,
+        Err(_) => {
+            set_err(&alloc::format!("dlopen: 读不到 {}", p));
+            return core::ptr::null_mut();
+        }
+    };
+    let o = match load_object(&img, &p) {
+        Ok(o) => o,
+        Err(e) => {
+            set_err(&alloc::format!("dlopen: 装载 {} 失败: {}", p, e));
+            return core::ptr::null_mut();
+        }
+    };
+    if o.has_tls {
+        set_err("dlopen: 该 .so 带 PT_TLS，运行期装载不支持（ADR-053 D4）");
+        return core::ptr::null_mut();
+    }
+    // 经裸指针访问 static mut：Rust 2024 禁止直接对 static mut 取引用（static_mut_refs）。
+    let handle = unsafe { (*core::ptr::addr_of!(OBJECTS)).len() + 1 } as *mut u8;
+    unsafe { (*core::ptr::addr_of_mut!(OBJECTS)).push(o) };
+    // 新对象的符号解析在**加入全局表之后**做：这样它能看见全局作用域，也能被看见。
+    // （对已装载对象重复解析是**幂等**的：RELATIVE/GLOB_DAT/JUMP_SLOT 都写入同一值。）
+    let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
+    if let Err(e) = relocate_all(objs) {
+        set_err(&alloc::format!("dlopen: {} 重定位失败: {}", p, e));
+        return core::ptr::null_mut();
+    }
+    unsafe { LAST_ERR = None };
+    handle
+}
+
+/// `dlsym(handle, name)`：在指定句柄对应的对象里查符号（找不到返回 NULL）。
+#[unsafe(no_mangle)]
+pub extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
+    let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
+    let idx = handle as usize;
+    if idx == 0 || idx > objs.len() || name.is_null() {
+        set_err("dlsym: 句柄或名字非法");
+        return core::ptr::null_mut();
+    }
+    let n = unsafe { read_cstr(name as u64) };
+    let o = &objs[idx - 1];
+    for si in 1..o.nsyms() {
+        if let Some((sn, val, shndx)) = o.sym(si) {
+            if shndx != 0 && sn == n {
+                return (o.base + val) as *mut u8;
+            }
+        }
+    }
+    set_err(&alloc::format!("dlsym: 未找到 {}", n));
+    core::ptr::null_mut()
+}
+
+/// `dlerror()`：取最近一次错误描述（无错误返回 NULL）。
+///
+/// 返回的指针指向 rtld 内部存储，**下次调用可能被覆盖**（POSIX 同约定）。
+#[unsafe(no_mangle)]
+pub extern "C" fn dlerror() -> *const u8 {
+    let e = unsafe { &*core::ptr::addr_of!(LAST_ERR) };
+    match e {
+        // Rust 的 String 缓冲区保证 NUL 结尾，故可直接当 C 串返回。
+        Some(s) => s.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// rtld 自己提供给被装载程序的符号（`resolve` 的**内置表**）。
+fn builtin_symbol(name: &str) -> Option<u64> {
+    let table: [(&str, usize); 3] = [
+        // 先转成函数**指针**再转整数：直接 cast 函数项会被 lint 拒绝（实测警告）。
+        ("dlopen", dlopen as *const () as usize),
+        ("dlsym", dlsym as *const () as usize),
+        ("dlerror", dlerror as *const () as usize),
+    ];
+    table.iter().find(|(n, _)| *n == name).map(|(_, a)| *a as u64)
+}
+
 #[boruix_std::main]
 fn main() {
     let argv: Vec<&[u8]> = args().collect();
@@ -431,13 +552,15 @@ fn main() {
             return;
         }
     };
-    let objs = match load_closure(path) {
-        Ok(o) => o,
+    // 装载结果放进**全局表**：`dlopen` 运行期追加的对象要与启动期装载的处于同一作用域。
+    match load_closure(path) {
+        Ok(o) => unsafe { OBJECTS = o },
         Err(e) => {
             println!("[rtld] 装载失败: {}", e);
             return;
         }
-    };
+    }
+    let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
     println!("[rtld] 共装载 {} 个对象", objs.len());
     for (i, o) in objs.iter().enumerate() {
         println!("[rtld]   [{}] {} base=0x{:x}", i, o.path, o.base);
