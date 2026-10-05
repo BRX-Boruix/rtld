@@ -1,34 +1,35 @@
 //! rtld —— BORUIX 用户态动态链接器（阶段 5 / 3P5-1）。
 //!
-//! ## 为什么是"独立程序"而不是内核自动装载（架构决策）
+//! ## 架构决策：`ld.so` 模型
 //!
-//! 本系统的 `exec` 是**用户态读好镜像再交给内核**的（`Image::Slice`/`Image::Shm`），
-//! 内核**没有**"按路径读程序"的能力；而标准 `PT_INTERP` 自动装载要求内核按路径读解释器。
-//! 故采用 **`ld.so` 模型**：`rtld <program> [args...]`，rtld 自己读文件、自己 mmap、
-//! 自己做重定位。**内核不需要理解 ELF 重定位**（S13 边界）。
+//! 本系统的 `exec` 是**用户态读好镜像再交给内核**的（`Image::Slice`/`Image::Shm`），内核
+//! **没有**"按路径读程序"的能力；而标准 `PT_INTERP` 自动装载要求内核按路径读解释器。
+//! 故采用 `rtld <program> [args...]`：rtld 自己读文件、自己 mmap、自己做重定位。
+//! **内核不需要理解 ELF 重定位**（S13 边界）。
 //!
-//! ## 当前能力（本文件）
+//! ## 能力
 //!
-//! 1. 解析 ELF64 头与程序头；
-//! 2. 把全部 `PT_LOAD` 按 `p_vaddr` 的相对布局**一次性 mmap**（保证段间相对偏移不变），
-//!    拷贝文件内容、补零 bss、按 `p_flags` 逐段 `mprotect`；
-//! 3. 解析 `PT_DYNAMIC`，应用 **`R_X86_64_RELATIVE`** 重定位；
-//! 4. 经 `DT_SYMTAB`/`DT_STRTAB`/`DT_HASH` 查导出符号；
-//! 5. 调用查到的函数（用于验收；将来改为跳到 `e_entry`）。
+//! 1. 解析 ELF64 头/程序头/`PT_DYNAMIC`；
+//! 2. 一次 mmap 覆盖全部 `PT_LOAD` 的跨度（保证段间相对偏移不变）+ 拷贝 + 补零 bss + 逐段 mprotect；
+//! 3. **`DT_NEEDED` 递归装载**（在程序所在目录与 `/lib` 中查找）；
+//! 4. **跨模块符号解析**（主对象优先，其后按装载顺序）；
+//! 5. 重定位：`R_X86_64_RELATIVE` / `GLOB_DAT` / `JUMP_SLOT`；
+//! 6. 调用导出符号（验收用）。
 //!
-//! **尚未做（如实声明）**：`DT_NEEDED` 递归装载、`GLOB_DAT`/`JUMP_SLOT` 重定位、
-//! `.so` 级 TLS（ADR-053）。遇到这些重定位类型时**如实报错**，绝不静默跳过。
+//! **尚未做（如实声明）**：跳到 `e_entry`（现为调用导出函数）、`.so` 级 TLS（ADR-053）、
+//! `dlopen`/`dlsym`（3P5-3）。遇到不支持的重定位类型**如实报错**，绝不静默跳过。
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use boruix_std::{args, print, println};
+use boruix_std::{args, println};
 
 const PAGE: u64 = 4096;
 
-// ---------- ELF64 结构 ----------
+// ---------- ELF64 ----------
 
 #[derive(Debug, Clone, Copy)]
 struct ElfHeader {
@@ -64,18 +65,15 @@ fn rd_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-fn parse_header(b: &[u8]) -> Result<ElfHeader, &'static str> {
+fn parse_header(b: &[u8]) -> Result<ElfHeader, String> {
     if b.len() < 64 {
-        return Err("文件小于 ELF64 头");
+        return Err("文件小于 ELF64 头".to_string());
     }
     if &b[0..4] != b"\x7fELF" {
-        return Err("不是 ELF（魔数不符）");
+        return Err("不是 ELF（魔数不符）".to_string());
     }
-    if b[4] != 2 {
-        return Err("不是 ELF64");
-    }
-    if b[5] != 1 {
-        return Err("不是小端");
+    if b[4] != 2 || b[5] != 1 {
+        return Err("不是小端 ELF64".to_string());
     }
     Ok(ElfHeader {
         e_type: rd_u16(b, 16),
@@ -87,15 +85,15 @@ fn parse_header(b: &[u8]) -> Result<ElfHeader, &'static str> {
     })
 }
 
-fn parse_phdrs(b: &[u8], h: &ElfHeader) -> Result<Vec<Phdr>, &'static str> {
+fn parse_phdrs(b: &[u8], h: &ElfHeader) -> Result<Vec<Phdr>, String> {
     if h.e_phentsize as usize != 56 {
-        return Err("phentsize != 56（非 ELF64 程序头）");
+        return Err("phentsize != 56".to_string());
     }
     let mut v = Vec::new();
     for i in 0..h.e_phnum as u64 {
         let off = (h.e_phoff + i * 56) as usize;
         if off + 56 > b.len() {
-            return Err("程序头表越界");
+            return Err("程序头表越界".to_string());
         }
         v.push(Phdr {
             p_type: rd_u32(b, off),
@@ -109,14 +107,6 @@ fn parse_phdrs(b: &[u8], h: &ElfHeader) -> Result<Vec<Phdr>, &'static str> {
     Ok(v)
 }
 
-// ---------- 装载 ----------
-
-/// 装载结果：段区间的基址 + `PT_DYNAMIC` 的用户 VA。
-struct Loaded {
-    base: u64,
-    dynamic: Option<u64>,
-}
-
 fn align_down(v: u64) -> u64 {
     v & !(PAGE - 1)
 }
@@ -126,7 +116,6 @@ fn align_up(v: u64) -> u64 {
 }
 
 fn prot_of(flags: u32) -> u64 {
-    // p_flags: 1=X 2=W 4=R
     let mut p = 0u64;
     if flags & 4 != 0 {
         p |= 1;
@@ -140,65 +129,11 @@ fn prot_of(flags: u32) -> u64 {
     p
 }
 
-/// 装载一个 ET_DYN 对象：一次 mmap 覆盖全部 PT_LOAD 的跨度（保证段间相对偏移不变）。
-fn load_object(image: &[u8], phdrs: &[Phdr]) -> Result<Loaded, &'static str> {
-    let loads: Vec<&Phdr> = phdrs.iter().filter(|p| p.p_type == 1).collect();
-    if loads.is_empty() {
-        return Err("没有 PT_LOAD");
-    }
-    let min_va = loads.iter().map(|p| align_down(p.p_vaddr)).min().unwrap();
-    let max_va = loads.iter().map(|p| align_up(p.p_vaddr + p.p_memsz)).max().unwrap();
-    let span = max_va - min_va;
-    if span == 0 {
-        return Err("段跨度为 0");
-    }
-    // 先按 RW 映射整段（拷贝内容需要写权限），随后逐段收紧。
-    let base = match boruix_std::libsys::mmap_prot(span, 1 | 2) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("[rtld] mmap({}) 失败: {:?}", span, e);
-            return Err("mmap 失败");
-        }
-    };
-    // 拷贝每个段的内容 + 补零 bss。
-    for p in &loads {
-        let dst = base + (p.p_vaddr - min_va);
-        let src_off = p.p_offset as usize;
-        let filesz = p.p_filesz as usize;
-        if src_off + filesz > image.len() {
-            return Err("段内容越界");
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(image.as_ptr().add(src_off), dst as *mut u8, filesz);
-            // bss：filesz..memsz 清零。
-            let bss = (p.p_memsz - p.p_filesz) as usize;
-            if bss > 0 {
-                core::ptr::write_bytes((dst + p.p_filesz) as *mut u8, 0, bss);
-            }
-        }
-    }
-    // 逐段收紧权限（W^X 由内核单点裁决；这里只按 p_flags 如实申请）。
-    for p in &loads {
-        let start = align_down(base + (p.p_vaddr - min_va));
-        let end = align_up(base + (p.p_vaddr - min_va) + p.p_memsz);
-        if let Err(e) = boruix_std::libsys::mprotect(start, end - start, prot_of(p.p_flags)) {
-            println!("[rtld] mprotect(0x{:x}, {}) 失败: {:?}", start, end - start, e);
-            return Err("mprotect 失败");
-        }
-    }
-    let dynamic = phdrs
-        .iter()
-        .find(|p| p.p_type == 2)
-        .map(|p| base + (p.p_vaddr - min_va));
-    Ok(Loaded { base, dynamic })
-}
-
-// ---------- PT_DYNAMIC ----------
-//
-// 本表是 ELF 动态节的 **ABI 常量**：按名字列全，便于对照与下一步使用。
-// 当前只消费其中一部分，故在 crate 根显式放行未用项（而不是删掉——删掉会让下一个人重新查手册）。
+// ---------- 动态节 ----------
 
 const DT_NULL: u64 = 0;
+const DT_NEEDED: u64 = 1;
+const DT_PLTRELSZ: u64 = 2;
 const DT_HASH: u64 = 4;
 const DT_STRTAB: u64 = 5;
 const DT_SYMTAB: u64 = 6;
@@ -207,9 +142,7 @@ const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
 const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
-const DT_NEEDED: u64 = 1;
 const DT_JMPREL: u64 = 23;
-const DT_PLTRELSZ: u64 = 2;
 
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
@@ -217,17 +150,12 @@ const R_X86_64_RELATIVE: u32 = 8;
 
 /// 该 DT tag 的值是否为**虚拟地址**（装载后须加基址才能解引用）。
 ///
-/// 非地址型（`SIZE`/`ENT`/`NEEDED`/`COUNT`/`SONAME` 等）的值是标量或字符串表偏移，
-/// **不得**加基址。此分类是 ELF 规范事实，集中在此单点（S15）。
+/// 非地址型（SIZE/ENT/NEEDED/COUNT/SONAME）是标量或字符串表偏移，**不得**加基址。
+/// 这是 ELF 规范事实，集中在此单点（S15）。
 fn is_dynamic_addr(tag: u64) -> bool {
     matches!(tag, 3 | 4 | 5 | 6 | 7 | 12 | 13 | 17 | 23 | 25 | 26 | 0x6ffffef5)
 }
 
-/// 解析 PT_DYNAMIC，返回 `(tag, val)` 列表。
-///
-/// **地址型 tag 的值在这里统一加上 `base`**（S15 单点）：ELF 动态节里的
-/// `DT_SYMTAB`/`DT_STRTAB`/`DT_HASH`/`DT_RELA`/`DT_JMPREL` 等是**虚拟地址**，装载到
-/// 任意基址后必须加偏移。此前直接用原值解引用 → 访问低地址 → SIGSEGV（实测退出码 11）。
 fn read_dynamic(dyn_va: u64, base: u64) -> Vec<(u64, u64)> {
     let mut v = Vec::new();
     let mut p = dyn_va;
@@ -252,16 +180,190 @@ fn dyn_get(d: &[(u64, u64)], tag: u64) -> Option<u64> {
     d.iter().find(|(t, _)| *t == tag).map(|(_, v)| *v)
 }
 
-/// 应用重定位。只支持 `R_X86_64_RELATIVE`；其余**如实报错**（S09）。
-fn apply_relocations(d: &[(u64, u64)], base: u64) -> Result<usize, &'static str> {
-    let Some(rela) = dyn_get(d, DT_RELA) else {
-        return Ok(0);
-    };
-    let relasz = dyn_get(d, DT_RELASZ).unwrap_or(0);
-    let relaent = dyn_get(d, DT_RELAENT).unwrap_or(24);
-    if relaent != 24 {
-        return Err("RELAENT != 24");
+/// 读 C 字符串（NUL 结尾）。
+unsafe fn read_cstr(mut p: u64) -> String {
+    let mut s = String::new();
+    loop {
+        let c = unsafe { *(p as *const u8) };
+        if c == 0 {
+            break;
+        }
+        s.push(c as char);
+        p += 1;
+        if s.len() > 4096 {
+            break; // 防御：畸形镜像不该让我们无限读下去
+        }
     }
+    s
+}
+
+// ---------- 已装载对象 ----------
+
+struct Object {
+    path: String,
+    base: u64,
+    dyn_: Vec<(u64, u64)>,
+}
+
+impl Object {
+    /// 该对象的 `.dynsym` 符号总数（经 DT_HASH 的 nchain）。
+    fn nsyms(&self) -> usize {
+        match dyn_get(&self.dyn_, DT_HASH) {
+            Some(h) => unsafe { *((h + 4) as *const u32) as usize },
+            None => 0,
+        }
+    }
+
+    /// 取第 i 个动态符号的 (名字, st_value, st_shndx)。
+    fn sym(&self, i: usize) -> Option<(String, u64, u16)> {
+        let symtab = dyn_get(&self.dyn_, DT_SYMTAB)?;
+        let strtab = dyn_get(&self.dyn_, DT_STRTAB)?;
+        let s = symtab + (i as u64) * 24;
+        let st_name = unsafe { *(s as *const u32) } as u64;
+        let st_value = unsafe { *((s + 8) as *const u64) };
+        let st_shndx = unsafe { *((s + 6) as *const u16) };
+        let name = if st_name == 0 {
+            String::new()
+        } else {
+            unsafe { read_cstr(strtab + st_name) }
+        };
+        Some((name, st_value, st_shndx))
+    }
+}
+
+// ---------- 装载 ----------
+
+fn load_object(image: &[u8], path: &str) -> Result<Object, String> {
+    let h = parse_header(image)?;
+    if h.e_machine != 62 {
+        return Err("不是 x86-64".to_string());
+    }
+    let phdrs = parse_phdrs(image, &h)?;
+    let loads: Vec<&Phdr> = phdrs.iter().filter(|p| p.p_type == 1).collect();
+    if loads.is_empty() {
+        return Err("没有 PT_LOAD".to_string());
+    }
+    let min_va = loads.iter().map(|p| align_down(p.p_vaddr)).min().unwrap();
+    let max_va = loads.iter().map(|p| align_up(p.p_vaddr + p.p_memsz)).max().unwrap();
+    let span = max_va - min_va;
+    let base = match boruix_std::libsys::mmap_prot(span, 1 | 2) {
+        Ok(a) => a,
+        Err(e) => return Err(alloc::format!("mmap({}) 失败: {:?}", span, e)),
+    };
+    for p in &loads {
+        let dst = base + (p.p_vaddr - min_va);
+        let src_off = p.p_offset as usize;
+        let filesz = p.p_filesz as usize;
+        if src_off + filesz > image.len() {
+            return Err("段内容越界".to_string());
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(image.as_ptr().add(src_off), dst as *mut u8, filesz);
+            let bss = (p.p_memsz - p.p_filesz) as usize;
+            if bss > 0 {
+                core::ptr::write_bytes((dst + p.p_filesz) as *mut u8, 0, bss);
+            }
+        }
+    }
+    for p in &loads {
+        let start = align_down(base + (p.p_vaddr - min_va));
+        let end = align_up(base + (p.p_vaddr - min_va) + p.p_memsz);
+        if let Err(e) = boruix_std::libsys::mprotect(start, end - start, prot_of(p.p_flags)) {
+            return Err(alloc::format!("mprotect(0x{:x}) 失败: {:?}", start, e));
+        }
+    }
+    let dyn_va = phdrs
+        .iter()
+        .find(|p| p.p_type == 2)
+        .map(|p| base + (p.p_vaddr - min_va));
+    let dyn_ = match dyn_va {
+        Some(v) => read_dynamic(v, base),
+        None => Vec::new(),
+    };
+    Ok(Object {
+        path: path.to_string(),
+        base,
+        dyn_,
+    })
+}
+
+/// 在目录 `dir` 与 `/lib` 中查找共享库。
+fn find_library(name: &str, dir: &str) -> Option<String> {
+    let c1 = alloc::format!("{}/{}", dir, name);
+    if boruix_std::libsys::stat(&c1).is_ok() {
+        return Some(c1);
+    }
+    let c2 = alloc::format!("/lib/{}", name);
+    if boruix_std::libsys::stat(&c2).is_ok() {
+        return Some(c2);
+    }
+    None
+}
+
+/// 递归装载（广度优先）：返回全部对象，第 0 个是主对象。
+fn load_closure(main_path: &str) -> Result<Vec<Object>, String> {
+    let dir = match main_path.rfind('/') {
+        Some(i) => &main_path[..i],
+        None => ".",
+    };
+    let mut objs: Vec<Object> = Vec::new();
+    let image = boruix_std::fs::read_to_end(main_path)
+        .map_err(|e| alloc::format!("读取 {} 失败: {:?}", main_path, e))?;
+    objs.push(load_object(&image, main_path)?);
+    let mut i = 0usize;
+    while i < objs.len() {
+        // 收集本对象的 DT_NEEDED（值是指向 STRTAB 的偏移，故须经该对象的 STRTAB 解读）。
+        let mut wanted: Vec<String> = Vec::new();
+        let strtab = dyn_get(&objs[i].dyn_, DT_STRTAB);
+        for (t, v) in &objs[i].dyn_ {
+            if *t == DT_NEEDED {
+                if let Some(st) = strtab {
+                    wanted.push(unsafe { read_cstr(st + *v) });
+                }
+            }
+        }
+        for name in wanted {
+            if objs.iter().any(|o| o.path.ends_with(&name)) {
+                continue; // 已装载（按文件名去重，够本阶段用）
+            }
+            let Some(full) = find_library(&name, dir) else {
+                return Err(alloc::format!("找不到依赖库 {}", name));
+            };
+            println!("[rtld] 装载依赖 {} -> {}", name, full);
+            let img = boruix_std::libsys::read_to_end(&full)
+                .map_err(|e| alloc::format!("读取 {} 失败: {:?}", full, e))?;
+            objs.push(load_object(&img, &full)?);
+        }
+        i += 1;
+    }
+    Ok(objs)
+}
+
+/// 全局作用域符号解析：返回**绝对地址**（主对象优先，其后按装载顺序）。
+///
+/// `st_shndx == 0` 表示**未定义**（引用），不算定义——这一条是正确性的关键：
+/// 若不排除，引用方自己的 UND 符号会先被命中，拿到的是 0 或错值。
+fn resolve(objs: &[Object], name: &str) -> Option<u64> {
+    for o in objs.iter() {
+        for si in 1..o.nsyms() {
+            if let Some((n, val, shndx)) = o.sym(si) {
+                if shndx != 0 && n == name {
+                    return Some(o.base + val);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 应用一段重定位表（.rela.dyn 或 .rela.plt）。
+fn apply_range(obj: &Object, objs: &[Object], rela: u64, relasz: u64) -> Result<usize, String> {
+    let relaent = dyn_get(&obj.dyn_, DT_RELAENT).unwrap_or(24);
+    if relaent != 24 {
+        return Err("RELAENT != 24".to_string());
+    }
+    let symtab = dyn_get(&obj.dyn_, DT_SYMTAB).unwrap_or(0);
+    let strtab = dyn_get(&obj.dyn_, DT_STRTAB).unwrap_or(0);
     let mut n = 0usize;
     let mut off = 0u64;
     while off + 24 <= relasz {
@@ -270,67 +372,48 @@ fn apply_relocations(d: &[(u64, u64)], base: u64) -> Result<usize, &'static str>
         let r_info = unsafe { *((e + 8) as *const u64) };
         let r_addend = unsafe { *((e + 16) as *const u64) };
         let r_type = (r_info & 0xffff_ffff) as u32;
+        let r_sym = (r_info >> 32) as usize;
         match r_type {
             R_X86_64_RELATIVE => {
-                let v = base.wrapping_add(r_addend);
-                unsafe { *((base + r_offset) as *mut u64) = v };
+                unsafe { *((obj.base + r_offset) as *mut u64) = obj.base.wrapping_add(r_addend) };
+                n += 1;
+            }
+            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                // 取符号名 → 在全局作用域里找定义 → 写实际地址。
+                let s = symtab + (r_sym as u64) * 24;
+                let st_name = unsafe { *(s as *const u32) } as u64;
+                let name = unsafe { read_cstr(strtab + st_name) };
+                let Some(addr) = resolve(objs, &name) else {
+                    return Err(alloc::format!("未定义符号 {}", name));
+                };
+                unsafe { *((obj.base + r_offset) as *mut u64) = addr };
                 n += 1;
             }
             other => {
-                println!("[rtld] 不支持的重定位类型 {} @ 0x{:x}", other, r_offset);
-                return Err("遇到不支持的重定位类型（未静默跳过）");
+                return Err(alloc::format!(
+                    "不支持的重定位类型 {} @ 0x{:x}（未静默跳过）",
+                    other, r_offset
+                ));
             }
         }
         off += 24;
     }
-    // .rela.plt（JUMP_SLOT）若存在但未实现，必须**明确报出**而不是当作没有。
-    if dyn_get(d, DT_JMPREL).is_some() && dyn_get(d, DT_PLTRELSZ).unwrap_or(0) > 0 {
-        return Err("存在 .rela.plt（JUMP_SLOT），尚未实现");
-    }
     Ok(n)
 }
 
-/// 经 DT_HASH 的 nchain 得到符号数，再按名字线性查找（本阶段够用；将来可换 GNU_HASH）。
-fn lookup_symbol(d: &[(u64, u64)], name: &str) -> Option<u64> {
-    let symtab = dyn_get(d, DT_SYMTAB)?;
-    let strtab = dyn_get(d, DT_STRTAB)?;
-    let hash = dyn_get(d, DT_HASH)?;
-    let nchain = unsafe { *((hash + 4) as *const u32) } as usize;
-    let syment = dyn_get(d, DT_SYMENT).unwrap_or(24);
-    if syment != 24 {
-        return None;
-    }
-    for i in 0..nchain {
-        let s = symtab + (i as u64) * 24;
-        let st_name = unsafe { *(s as *const u32) } as u64;
-        let st_value = unsafe { *((s + 8) as *const u64) };
-        if st_name == 0 {
-            continue;
+fn relocate_all(objs: &[Object]) -> Result<usize, String> {
+    let mut total = 0usize;
+    for o in objs {
+        if let (Some(rela), Some(sz)) = (dyn_get(&o.dyn_, DT_RELA), dyn_get(&o.dyn_, DT_RELASZ)) {
+            total += apply_range(o, objs, rela, sz)?;
         }
-        let p = strtab + st_name;
-        let mut ok = true;
-        for (k, c) in name.bytes().enumerate() {
-            let got = unsafe { *((p + k as u64) as *const u8) };
-            if got != c {
-                ok = false;
-                break;
-            }
-        }
-        if ok && unsafe { *((p + name.len() as u64) as *const u8) } == 0 {
-            return Some(st_value);
+        if let (Some(jmprel), Some(sz)) =
+            (dyn_get(&o.dyn_, DT_JMPREL), dyn_get(&o.dyn_, DT_PLTRELSZ))
+        {
+            total += apply_range(o, objs, jmprel, sz)?;
         }
     }
-    None
-}
-
-fn show_arg(a: &[u8]) {
-    for &c in a {
-        if (0x20..0x7f).contains(&c) {
-            print!("{}", c as char);
-        } else {
-            print!("\\x{:02x}", c);
-        }
-    }
+    Ok(total)
 }
 
 #[boruix_std::main]
@@ -348,64 +431,39 @@ fn main() {
             return;
         }
     };
-    let image = match boruix_std::fs::read_to_end(path) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("[rtld] 读取 {:?} 失败: {:?}", path, e);
-            return;
-        }
-    };
-    println!("[rtld] 目标 {} 字节", image.len());
-    let h = match parse_header(&image) {
-        Ok(h) => h,
-        Err(e) => {
-            println!("[rtld] 解析失败: {}", e);
-            return;
-        }
-    };
-    println!(
-        "[rtld] ELF: type={} machine={} entry=0x{:x} phnum={}",
-        h.e_type, h.e_machine, h.e_entry, h.e_phnum
-    );
-    let phdrs = match parse_phdrs(&image, &h) {
-        Ok(p) => p,
-        Err(e) => {
-            println!("[rtld] 程序头解析失败: {}", e);
-            return;
-        }
-    };
-    let loaded = match load_object(&image, &phdrs) {
-        Ok(l) => l,
+    let objs = match load_closure(path) {
+        Ok(o) => o,
         Err(e) => {
             println!("[rtld] 装载失败: {}", e);
             return;
         }
     };
-    println!("[rtld] 已装载 base=0x{:x} dynamic={:?}", loaded.base, loaded.dynamic);
-    let Some(dyn_va) = loaded.dynamic else {
-        println!("[rtld] 该镜像没有 PT_DYNAMIC（静态程序无需 rtld）");
-        return;
-    };
-    let d = read_dynamic(dyn_va, loaded.base);
-    println!("[rtld] DT_* 条目 {} 个", d.len());
-    match apply_relocations(&d, loaded.base) {
-        Ok(n) => println!("[rtld] 已应用 {} 个 R_X86_64_RELATIVE", n),
+    println!("[rtld] 共装载 {} 个对象", objs.len());
+    for (i, o) in objs.iter().enumerate() {
+        println!("[rtld]   [{}] {} base=0x{:x}", i, o.path, o.base);
+    }
+    match relocate_all(&objs) {
+        Ok(n) => println!("[rtld] 已应用 {} 个重定位", n),
         Err(e) => {
             println!("[rtld] 重定位失败: {}", e);
             return;
         }
     }
-    // 验收路径：调用目标程序导出的 check()，由它验证重定位是否生效。
-    match lookup_symbol(&d, "check") {
-        Some(off) => {
-            let addr = loaded.base + off;
-            println!("[rtld] 找到 check @ 0x{:x}，调用它", addr);
-            let f: extern "C" fn() -> i32 = unsafe { core::mem::transmute(addr) };
-            let r = f();
-            println!("[rtld] check() 返回 {}", r);
-            println!("[rtld] 判定: {}", if r == 1 { "通过（重定位生效）" } else { "失败" });
+    // 验收路径：调用主对象导出的 check()。
+    let Some(addr) = resolve(&objs, "check") else {
+        println!("[rtld] 未找到符号 check");
+        return;
+    };
+    println!("[rtld] 调用 check @ 0x{:x}", addr);
+    let f: extern "C" fn() -> i32 = unsafe { core::mem::transmute(addr) };
+    let r = f();
+    println!("[rtld] check() 返回 {}", r);
+    println!(
+        "[rtld] 判定: {}",
+        if r == 1 {
+            "通过（跨模块调用打通）"
+        } else {
+            "失败"
         }
-        None => println!("[rtld] 未找到符号 check（该镜像可能不是本轮的验收对象）"),
-    }
-    let _ = argv.get(1);
+    );
 }
