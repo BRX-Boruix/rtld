@@ -1,0 +1,15 @@
+[package]
+name = "rtld"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "BORUIX 用户态动态链接器（阶段 5 / 3P5-1）"
+
+# 与 init/shell 同类：**系统内**组件，故对仓内 crate 用 path 依赖（第三方才用 git）。
+# libsys 经 boruix_std 自己的 git 依赖解析，此处无需重复声明。
+[dependencies]
+boruix_std = { path = "../sdk/boruix_std/boruix_std" }
+
+# rtld 必须能独立跑起来，故它**自己**不做动态链接（静态镜像）。
+[profile.dev]
+panic = "abort"
