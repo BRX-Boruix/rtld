@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""构建"真正调用共享库"的验收夹具（阶段 5 / 3P5-2）。
+"""构建"共享 libc"的验收夹具（阶段 5 / 3P5-2）。
 
-产物：dynprog.elf —— 含 DT_NEEDED: libboruixc.so.1 的 PIE，导出 check 供 rtld 调用。
+用法: python build_dynprog.py [源文件名...]
+      默认构建 dynprog.c 与 dynprog2.c，产出同名 .elf。
 
 依赖 `libboruixc.so.1`（由 tools/tools_build/build_so.py 产出）。
 用 `-l:libboruixc.so.1` 精确指定文件名——该 `.so` 只有带版本号的真名，没有 `libX.so` 链接名。
@@ -27,15 +28,23 @@ def run(cmd):
         sys.exit("命令失败（%d）" % r.returncode)
 
 
+def build(stem):
+    src = os.path.join(HERE, stem + ".c")
+    obj = os.path.join(HERE, stem + ".o")
+    out = os.path.join(HERE, stem + ".elf")
+    run([CLANG, TARGET, "-ffreestanding", "-fno-builtin", "-fPIE", "-O2", "-c", src, "-o", obj])
+    run([LLD, "-pie", "-e", "check", "--no-dynamic-linker", "-z", "norelro",
+         "--export-dynamic", "-o", out, obj,
+         "-L" + os.path.dirname(SO), "-l:libboruixc.so.1"])
+    print("[build_dynprog] 产出", out)
+
+
 def main():
     if not os.path.isfile(SO):
         sys.exit("找不到 %s——先跑 tools/tools_build/build_so.py" % SO)
-    run([CLANG, TARGET, "-ffreestanding", "-fno-builtin", "-fPIE", "-O2",
-         "-c", os.path.join(HERE, "dynprog.c"), "-o", os.path.join(HERE, "dynprog.o")])
-    run([LLD, "-pie", "-e", "check", "--no-dynamic-linker", "-z", "norelro",
-         "--export-dynamic", "-o", os.path.join(HERE, "dynprog.elf"),
-         os.path.join(HERE, "dynprog.o"), "-L" + os.path.dirname(SO), "-l:libboruixc.so.1"])
-    print("[build_dynprog] 产出", os.path.join(HERE, "dynprog.elf"))
+    stems = sys.argv[1:] or ["dynprog", "dynprog2"]
+    for s in stems:
+        build(os.path.splitext(s)[0])
 
 
 if __name__ == "__main__":
