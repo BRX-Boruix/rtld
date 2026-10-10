@@ -202,6 +202,11 @@ unsafe fn read_cstr(mut p: u64) -> String {
 struct Object {
     path: String,
     base: u64,
+    /// 整段映射的字节数（与 `mmap` 请求的 span 成对）。
+    ///
+    /// 必须在装载时记下：span 由 ELF 程序头算出，`dlclose` 时镜像早已不在手里，
+    /// 事后无法再推；而 `munmap` 必须与 `mmap` 的地址与长度**严格成对**。
+    map_len: u64,
     dyn_: Vec<(u64, u64)>,
     /// 该对象是否带 `PT_TLS`。
     ///
@@ -264,7 +269,9 @@ fn load_object(image: &[u8], path: &str) -> Result<Object, String> {
     }
     let min_va = loads.iter().map(|p| align_down(p.p_vaddr)).min().unwrap();
     let max_va = loads.iter().map(|p| align_up(p.p_vaddr + p.p_memsz)).max().unwrap();
-    let span = max_va - min_va;
+    // 页对齐后再作为请求长度：munmap 要求长度是 4KiB 整数倍，故这里算出的值
+    // 必须同时用于 mmap 与 munmap，不能只在装载时算一次、卸载时另算一次。
+    let span = align_up(max_va - min_va);
     let base = match boruix_std::libsys::mmap_prot(span, 1 | 2) {
         Ok(a) => a,
         Err(e) => return Err(alloc::format!("mmap({}) 失败: {:?}", span, e)),
@@ -302,6 +309,7 @@ fn load_object(image: &[u8], path: &str) -> Result<Object, String> {
     Ok(Object {
         path: path.to_string(),
         base,
+        map_len: span,
         dyn_,
         has_tls: phdrs.iter().any(|p| p.p_type == 7),
         // 句柄与引用计数由调用方决定：启动期装载给 -1（永久），dlopen 给 1。
@@ -490,7 +498,12 @@ fn next_handle() -> u64 {
 /// `dlopen(path, flags)`：运行期装载一个共享库，返回**不透明句柄**（失败返回 NULL）。
 ///
 /// **支持**：`RTLD_LAZY`/`RTLD_NOW`/`RTLD_GLOBAL`/`RTLD_LOCAL` 的语义（本实现一律**立即**
-/// 解析全部重定位，故 LAZY 与 NOW 无区别——如实声明）；`RTLD_NOLOAD` 等未实现。
+/// 解析全部重定位，故 LAZY 与 NOW 无区别——如实声明）；`RTLD_NOLOAD` 与
+/// `RTLD_NODELETE` 均已实现。
+///
+/// **未做（如实声明）**：本函数**不**自动装载该对象的 `DT_NEEDED`——依赖库必须由调用方
+/// 自己先 `dlopen`（`load_closure` 只用于启动期闭包）。因此 `dlclose` 的「仍有依赖者
+/// 则拒绝卸载」判定，依据的是调用方**实际装载过**的那些对象所声明的 `DT_NEEDED`。
 ///
 /// **带 `PT_TLS` 的 `.so` 如实拒绝**（ADR-053 D4）：initial-exec 的偏移必须在进程启动时
 /// 确定，运行期追加会改变已有模块的偏移，已装载模块的 GOT 槽会全部失效。
@@ -543,6 +556,9 @@ pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
         }
     };
     if o.has_tls {
+        // load_object 已经 mmap 过了。拒绝装载就必须把这段映射还回去——否则
+        // 每次拒绝都泄漏一段地址空间，且调用方只看到 NULL，无从发现（S18）。
+        let _ = boruix_std::libsys::munmap(o.base, o.map_len);
         set_err("dlopen: 该 .so 带 PT_TLS，运行期装载不支持（ADR-053 D4）");
         return core::ptr::null_mut();
     }
@@ -556,6 +572,16 @@ pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
     // （对已装载对象重复解析是**幂等**的：RELATIVE/GLOB_DAT/JUMP_SLOT 都写入同一值。）
     let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
     if let Err(e) = relocate_all(objs) {
+        // 失败即回滚：对象已入表且映射已建立。若只返回 NULL 而不清理，就会留下
+        // 一个「表里有、句柄无人知」的对象——地址空间泄漏，且后续对同一路径的
+        // dlopen 会**命中它并返回一个从未成功装载过的句柄**。
+        let objs = unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) };
+        if let Some(i) = objs.iter().position(|o| o.handle == handle) {
+            let base = objs[i].base;
+            let len = objs[i].map_len;
+            objs.remove(i);
+            let _ = boruix_std::libsys::munmap(base, len);
+        }
         set_err(&alloc::format!("dlopen: {} 重定位失败: {}", p, e));
         return core::ptr::null_mut();
     }
@@ -588,19 +614,69 @@ pub extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
     core::ptr::null_mut()
 }
 
-/// dlclose(handle)：递减引用计数；**最后一个引用**释放时把对象移出已装载表。
+/// 取路径的最后一段。`DT_NEEDED` 里存的是裸库名（`libadd.so`），与装载时的全路径
+/// 只能按尾段精确比对——用 `ends_with` 会把 `add.so` 误判成 `libadd.so` 的依赖。
+fn basename(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// 在世对象里，第一个把 `objs[idx]` 声明为 `DT_NEEDED` 的对象路径（没有则 `None`）。
 ///
-/// **如实声明（S39）——本实现不回收地址空间**：对象只从**符号解析作用域**里摘除，
-/// 其代码/数据映射**不 munmap**。故 dlclose 之后：RTLD_NOLOAD 查不到它、relocate_all
-/// 不再重定位它，但已取出的函数指针**仍可调用**（POSIX 下这是调用方的责任）。
-/// 不 munmap 是**刻意的取舍**：rtld 尚未记录每个对象的段映射与依赖关系，
-/// 贸然解除映射会把「悬垂指针」从可诊断的符号查找失败变成**野写**。
-/// 真正的地址空间回收（含 DT_NEEDED 依赖计数）属独立事项，不塞进本项。
+/// 为什么这道门不可省：`dlclose` 现在会把该对象的整段映射归还。若还有别的在世
+/// 对象依赖它，那些对象里**已经写好**的 GOT/PLT 槽就指向已归还的物理帧——帧一旦被
+/// 复用，就是静默野写。这与「符号查找失败」不同：后者可诊断，前者不可。故此处
+/// **如实拒绝**卸载并指明是谁依赖，而不是把不可诊断的破坏留给运行期。
+fn dependent_on(objs: &[Object], idx: usize) -> Option<String> {
+    let target = basename(&objs[idx].path).to_string();
+    for (i, o) in objs.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        let strtab = dyn_get(&o.dyn_, DT_STRTAB);
+        for (t, v) in &o.dyn_ {
+            if *t != DT_NEEDED {
+                continue;
+            }
+            if let Some(st) = strtab {
+                let dep = unsafe { read_cstr(st + *v) };
+                if dep == target {
+                    return Some(o.path.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// dlclose(handle)：递减引用计数；**最后一个引用**释放时**归还地址空间**并摘除对象。
+///
+/// ## 真回收（本项修掉的正是这里的旧行为）
+///
+/// 旧实现在引用归零时只把对象移出符号解析作用域，**不 munmap**。后果是地址空间
+/// 只增不减：反复 dlopen/dlclose 同一个 .so 会持续消耗虚存与物理帧。
+/// 现在归零且未置 `RTLD_NODELETE` 时执行：
+///   1. **依赖者检查**——若还有在世对象声明依赖它，**拒绝**卸载（返回 -1 并说明
+///      是谁依赖）。这不是保守，而是唯一安全的选择，理由见 `dependent_on`。
+///   2. `munmap(base, map_len)`——与装载时的 `mmap` 严格成对；长度取自
+///      `Object.map_len`，不重算。
+///   3. 移出对象表。
+///
+/// **任何一步失败都复原引用计数**：否则对象会停在「表里有、计数为 0」，既不会被
+/// 再次回收，也不会被任何调用方持有——纯粹的泄漏。`munmap` 失败时对象**留在表内**
+/// （先 munmap 成功再 remove，顺序不可颠倒，否则失败后对象已不可达却仍占着映射）。
+///
+/// ## 卸载之后
+///
+/// 映射已归还 ⇒ `RTLD_NOLOAD` 查不到它，且**已取出的函数指针再调用是野指针**
+/// （POSIX 下这是调用方的责任；本实现不再提供「仍可调用」的宽松行为）。
 ///
 /// 启动期装载的对象（主程序与其 DT_NEEDED 闭包）引用计数为 -1（永不卸载），
 /// 对它们的 dlclose 是**合法的空操作**（返回 0）。
 ///
-/// 返回值：0 = 成功；-1 = 句柄非法/未知（同时置 dlerror）。
+/// 返回值：0 = 成功；-1 = 句柄非法/未知/仍有依赖者/munmap 失败（同时置 dlerror）。
 #[unsafe(no_mangle)]
 pub extern "C" fn dlclose(handle: *mut u8) -> i32 {
     let h = handle as u64;
@@ -619,9 +695,34 @@ pub extern "C" fn dlclose(handle: *mut u8) -> i32 {
         return 0;
     }
     objs[idx].refs -= 1;
-    if objs[idx].refs == 0 && !objs[idx].nodelete {
-        objs.remove(idx);
+    if objs[idx].refs > 0 || objs[idx].nodelete {
+        unsafe { LAST_ERR = None };
+        return 0;
     }
+    if let Some(dep) = dependent_on(objs, idx) {
+        objs[idx].refs = 1;
+        let msg = alloc::format!(
+            "dlclose: {} 仍被 {} 依赖（须先卸载依赖者）",
+            objs[idx].path,
+            dep
+        );
+        set_err(&msg);
+        return -1;
+    }
+    let base = objs[idx].base;
+    let len = objs[idx].map_len;
+    if let Err(e) = boruix_std::libsys::munmap(base, len) {
+        objs[idx].refs = 1;
+        let msg = alloc::format!(
+            "dlclose: munmap(0x{:x}, {}) 失败: {:?}（对象仍留在表内）",
+            base,
+            len,
+            e
+        );
+        set_err(&msg);
+        return -1;
+    }
+    objs.remove(idx);
     unsafe { LAST_ERR = None };
     0
 }
