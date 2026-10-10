@@ -209,6 +209,19 @@ struct Object {
     /// initial-exec 的偏移必须在进程启动时确定，运行期追加会改变已有模块的偏移
     /// （已装载模块的 GOT 槽全部失效）。
     has_tls: bool,
+    /// dlopen 句柄 id（稳定标识，不随对象表增删而变）。
+    ///
+    /// 为什么不是「表下标 + 1」：dlclose 会把对象移出表，下标随之漂移；用稳定 id 才能让
+    /// 旧句柄**明确失效**（查不到 ⇒ 报错），而不是**悄悄指向另一个对象**。
+    handle: u64,
+    /// 引用计数。
+    ///
+    /// - 大于 0：由 dlopen 装载且仍被引用；归零即摘除；
+    /// - -1：**启动期**装载（主程序与其 DT_NEEDED 闭包）——永不卸载，
+    ///   对它们的 dlclose 是合法的空操作。
+    refs: i32,
+    /// RTLD_NODELETE：置位时引用计数归零也**不摘除**对象。
+    nodelete: bool,
 }
 
 impl Object {
@@ -291,6 +304,10 @@ fn load_object(image: &[u8], path: &str) -> Result<Object, String> {
         base,
         dyn_,
         has_tls: phdrs.iter().any(|p| p.p_type == 7),
+        // 句柄与引用计数由调用方决定：启动期装载给 -1（永久），dlopen 给 1。
+        handle: 0,
+        refs: 0,
+        nodelete: false,
     })
 }
 
@@ -439,9 +456,35 @@ fn relocate_all(objs: &[Object]) -> Result<usize, String> {
 static mut OBJECTS: Vec<Object> = Vec::new();
 /// 最近一次错误的描述（`dlerror` 的返回值）。
 static mut LAST_ERR: Option<String> = None;
+/// dlerror 返回的 **C 串缓冲**（末尾带 NUL）。
+///
+/// **为什么必须有它**：Rust 的 String / Vec<u8> **不保证**末尾有 NUL，把
+/// String::as_ptr() 直接交给 C 的 %s 会**读越界**。机内实测（2026-10）：
+/// err=dlclose: 句柄非法3p/libadd.s ——错误串后面粘着无关的路径片段，
+/// 正是「缓冲区后面恰好跟着别的数据」。故这里显式补 NUL 再返回。
+static mut LAST_ERR_C: Vec<u8> = Vec::new();
 
 fn set_err(msg: &str) {
     unsafe { LAST_ERR = Some(msg.to_string()) };
+}
+
+/// dlopen 旗标（取值与 glibc 一致；编译期常量，无 ABI 含义）。
+const RTLD_LAZY: i32 = 0x00001;
+const RTLD_NOW: i32 = 0x00002;
+const RTLD_NOLOAD: i32 = 0x00004;
+const RTLD_GLOBAL: i32 = 0x00100;
+const RTLD_NODELETE: i32 = 0x01000;
+
+/// 句柄 id 分配器（从 1 起；0 保留为「空句柄」）。
+static mut NEXT_HANDLE: u64 = 1;
+
+fn next_handle() -> u64 {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(NEXT_HANDLE);
+        let h = *p;
+        *p = h + 1;
+        h
+    }
 }
 
 /// `dlopen(path, flags)`：运行期装载一个共享库，返回**不透明句柄**（失败返回 NULL）。
@@ -453,12 +496,38 @@ fn set_err(msg: &str) {
 /// 确定，运行期追加会改变已有模块的偏移，已装载模块的 GOT 槽会全部失效。
 #[unsafe(no_mangle)]
 pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
-    let _ = flags;
     if path.is_null() {
         set_err("dlopen: path 为 NULL");
         return core::ptr::null_mut();
     }
     let p = unsafe { read_cstr(path as u64) };
+    // 未知旗标**如实拒绝**（S09：静默忽略等于给出错误的成功）。已知集合见上方常量；
+    // RTLD_LAZY 与 RTLD_NOW 在本实现里无区别（一律立即解析全部重定位——如实声明）。
+    const KNOWN: i32 = RTLD_LAZY | RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL | RTLD_NODELETE;
+    if (flags & !KNOWN) != 0 {
+        set_err(&alloc::format!("dlopen: 不支持的旗标 0x{:x}", flags & !KNOWN));
+        return core::ptr::null_mut();
+    }
+    let noload = (flags & RTLD_NOLOAD) != 0;
+    // **先查已装载表**（按路径精确匹配；不做 realpath / 符号链接解析——如实声明）：
+    //   - RTLD_NOLOAD：命中即返回**同一句柄**；未命中**不装载**，返回 NULL；
+    //   - 普通 dlopen：命中即**递增引用计数**并返回同一句柄。
+    // 此前每次调用都 push 一份新对象 ⇒ 同一个 .so 会有两份映射、两个互不相等的句柄。
+    {
+        let objs = unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) };
+        if let Some(o) = objs.iter_mut().find(|o| o.path == p) {
+            if o.refs >= 0 {
+                o.refs += 1;
+            }
+            let h = o.handle;
+            unsafe { LAST_ERR = None };
+            return h as *mut u8;
+        }
+    }
+    if noload {
+        set_err(&alloc::format!("dlopen: {} 未装载（RTLD_NOLOAD 不装载）", p));
+        return core::ptr::null_mut();
+    }
     let img = match boruix_std::fs::read_to_end(&p) {
         Ok(v) => v,
         Err(_) => {
@@ -466,7 +535,7 @@ pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
             return core::ptr::null_mut();
         }
     };
-    let o = match load_object(&img, &p) {
+    let mut o = match load_object(&img, &p) {
         Ok(o) => o,
         Err(e) => {
             set_err(&alloc::format!("dlopen: 装载 {} 失败: {}", p, e));
@@ -477,8 +546,11 @@ pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
         set_err("dlopen: 该 .so 带 PT_TLS，运行期装载不支持（ADR-053 D4）");
         return core::ptr::null_mut();
     }
+    o.refs = 1;
+    o.nodelete = (flags & RTLD_NODELETE) != 0;
+    o.handle = next_handle();
+    let handle = o.handle;
     // 经裸指针访问 static mut：Rust 2024 禁止直接对 static mut 取引用（static_mut_refs）。
-    let handle = unsafe { (*core::ptr::addr_of!(OBJECTS)).len() + 1 } as *mut u8;
     unsafe { (*core::ptr::addr_of_mut!(OBJECTS)).push(o) };
     // 新对象的符号解析在**加入全局表之后**做：这样它能看见全局作用域，也能被看见。
     // （对已装载对象重复解析是**幂等**的：RELATIVE/GLOB_DAT/JUMP_SLOT 都写入同一值。）
@@ -488,20 +560,23 @@ pub extern "C" fn dlopen(path: *const u8, flags: i32) -> *mut u8 {
         return core::ptr::null_mut();
     }
     unsafe { LAST_ERR = None };
-    handle
+    handle as *mut u8
 }
 
 /// `dlsym(handle, name)`：在指定句柄对应的对象里查符号（找不到返回 NULL）。
 #[unsafe(no_mangle)]
 pub extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
-    let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
-    let idx = handle as usize;
-    if idx == 0 || idx > objs.len() || name.is_null() {
+    let h = handle as u64;
+    if h == 0 || name.is_null() {
         set_err("dlsym: 句柄或名字非法");
         return core::ptr::null_mut();
     }
     let n = unsafe { read_cstr(name as u64) };
-    let o = &objs[idx - 1];
+    let objs = unsafe { &*core::ptr::addr_of!(OBJECTS) };
+    let Some(o) = objs.iter().find(|o| o.handle == h) else {
+        set_err("dlsym: 未知句柄（可能已被 dlclose 摘除）");
+        return core::ptr::null_mut();
+    };
     for si in 1..o.nsyms() {
         if let Some((sn, val, shndx)) = o.sym(si) {
             if shndx != 0 && sn == n {
@@ -513,6 +588,44 @@ pub extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// dlclose(handle)：递减引用计数；**最后一个引用**释放时把对象移出已装载表。
+///
+/// **如实声明（S39）——本实现不回收地址空间**：对象只从**符号解析作用域**里摘除，
+/// 其代码/数据映射**不 munmap**。故 dlclose 之后：RTLD_NOLOAD 查不到它、relocate_all
+/// 不再重定位它，但已取出的函数指针**仍可调用**（POSIX 下这是调用方的责任）。
+/// 不 munmap 是**刻意的取舍**：rtld 尚未记录每个对象的段映射与依赖关系，
+/// 贸然解除映射会把「悬垂指针」从可诊断的符号查找失败变成**野写**。
+/// 真正的地址空间回收（含 DT_NEEDED 依赖计数）属独立事项，不塞进本项。
+///
+/// 启动期装载的对象（主程序与其 DT_NEEDED 闭包）引用计数为 -1（永不卸载），
+/// 对它们的 dlclose 是**合法的空操作**（返回 0）。
+///
+/// 返回值：0 = 成功；-1 = 句柄非法/未知（同时置 dlerror）。
+#[unsafe(no_mangle)]
+pub extern "C" fn dlclose(handle: *mut u8) -> i32 {
+    let h = handle as u64;
+    if h == 0 {
+        set_err("dlclose: 句柄非法");
+        return -1;
+    }
+    let objs = unsafe { &mut *core::ptr::addr_of_mut!(OBJECTS) };
+    let Some(idx) = objs.iter().position(|o| o.handle == h) else {
+        set_err("dlclose: 未知句柄");
+        return -1;
+    };
+    if objs[idx].refs < 0 {
+        // 启动期对象：合法空操作。
+        unsafe { LAST_ERR = None };
+        return 0;
+    }
+    objs[idx].refs -= 1;
+    if objs[idx].refs == 0 && !objs[idx].nodelete {
+        objs.remove(idx);
+    }
+    unsafe { LAST_ERR = None };
+    0
+}
+
 /// `dlerror()`：取最近一次错误描述（无错误返回 NULL）。
 ///
 /// 返回的指针指向 rtld 内部存储，**下次调用可能被覆盖**（POSIX 同约定）。
@@ -520,18 +633,27 @@ pub extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
 pub extern "C" fn dlerror() -> *const u8 {
     let e = unsafe { &*core::ptr::addr_of!(LAST_ERR) };
     match e {
-        // Rust 的 String 缓冲区保证 NUL 结尾，故可直接当 C 串返回。
-        Some(s) => s.as_ptr(),
+        Some(s) => {
+            // **不能直接返回 s.as_ptr()**：String / Vec<u8> 不保证末尾有 NUL，
+            // C 的 %s 会越过缓冲区末尾继续读（实测粘上无关路径片段）。
+            // 显式补 NUL，把「最近的错误」变成**合法的 C 串**。
+            let v = unsafe { &mut *core::ptr::addr_of_mut!(LAST_ERR_C) };
+            v.clear();
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+            v.as_ptr()
+        }
         None => core::ptr::null(),
     }
 }
 
 /// rtld 自己提供给被装载程序的符号（`resolve` 的**内置表**）。
 fn builtin_symbol(name: &str) -> Option<u64> {
-    let table: [(&str, usize); 3] = [
+    let table: [(&str, usize); 4] = [
         // 先转成函数**指针**再转整数：直接 cast 函数项会被 lint 拒绝（实测警告）。
         ("dlopen", dlopen as *const () as usize),
         ("dlsym", dlsym as *const () as usize),
+        ("dlclose", dlclose as *const () as usize),
         ("dlerror", dlerror as *const () as usize),
     ];
     table.iter().find(|(n, _)| *n == name).map(|(_, a)| *a as u64)
@@ -554,7 +676,16 @@ fn main() {
     };
     // 装载结果放进**全局表**：`dlopen` 运行期追加的对象要与启动期装载的处于同一作用域。
     match load_closure(path) {
-        Ok(o) => unsafe { OBJECTS = o },
+        Ok(mut o) => {
+            // 启动期对象同样分配**稳定句柄**、引用计数记为 -1（永不卸载）：
+            // 这样 RTLD_NOLOAD 对主程序与其依赖也能如实返回同一句柄，
+            // 而不是与「未装载」无法区分。
+            for ob in o.iter_mut() {
+                ob.handle = next_handle();
+                ob.refs = -1;
+            }
+            unsafe { OBJECTS = o }
+        }
         Err(e) => {
             println!("[rtld] 装载失败: {}", e);
             return;
